@@ -3,6 +3,8 @@ package ias.dekstop;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -11,34 +13,37 @@ public class DashboardFrame extends JFrame {
 
     private JLabel userEmailLabel;
     private JButton logoutButton;
+    private JLabel enable2FALink;
+    /** Email used at login - used for 2FA even if /api/user fails */
+    private final String loginEmail;
 
-    // Colors matching web design
+    // Colors matching web design (like localhost:8080/dashboard)
     private static final Color BG_COLOR = new Color(248, 248, 248); // #F8F8F8
     private static final Color TEXT_COLOR = new Color(51, 51, 51); // #333333
     private static final Color BUTTON_GREEN = new Color(76, 175, 80); // #4CAF50
+    private static final Color LINK_BLUE = new Color(0, 102, 204);   // blue link like web
 
-    public DashboardFrame() {
+    /** @param loginEmail email used to log in (so 2FA can be keyed correctly even without backend) */
+    public DashboardFrame(String loginEmail) {
+        this.loginEmail = loginEmail != null ? loginEmail.trim() : "";
         setTitle("IAS Dashboard");
         setSize(900, 700);
         setLocationRelativeTo(null);
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         
-        // Set background color
         getContentPane().setBackground(BG_COLOR);
-        
         setLayout(new BorderLayout());
         
-        // Create header
         JPanel headerPanel = createHeader();
         add(headerPanel, BorderLayout.NORTH);
-        
-        // Create main content
         JPanel mainPanel = createMainContent();
         add(mainPanel, BorderLayout.CENTER);
 
+        // Show login email immediately so 2FA setup always has the right email
+        if (!this.loginEmail.isEmpty()) {
+            userEmailLabel.setText(this.loginEmail);
+        }
         setVisible(true);
-        
-        // Load user email
         loadUserEmail();
     }
     
@@ -101,16 +106,50 @@ public class DashboardFrame extends JFrame {
         welcomeSub.setFont(new Font("Arial", Font.PLAIN, 16));
         welcomeSub.setForeground(TEXT_COLOR);
         welcomeSub.setAlignmentX(Component.LEFT_ALIGNMENT);
+        welcomeSub.setBorder(new EmptyBorder(0, 0, 20, 0));
+
+        enable2FALink = new JLabel("Enable Two-Factor Authentication (Google Authenticator)");
+        enable2FALink.setFont(new Font("Arial", Font.PLAIN, 14));
+        enable2FALink.setForeground(LINK_BLUE);
+        enable2FALink.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        enable2FALink.setAlignmentX(Component.LEFT_ALIGNMENT);
+        enable2FALink.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                String email = userEmailLabel.getText();
+                if (email == null || email.trim().isEmpty() || "—".equals(email.trim())) {
+                    email = loginEmail;
+                }
+                TotpSetupDialog d = new TotpSetupDialog(DashboardFrame.this, email, DashboardFrame.this);
+                d.setVisible(true);
+            }
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                enable2FALink.setText("<html><u>Enable Two-Factor Authentication (Google Authenticator)</u></html>");
+            }
+            @Override
+            public void mouseExited(MouseEvent e) {
+                enable2FALink.setText("Enable Two-Factor Authentication (Google Authenticator)");
+            }
+        });
         
         welcomePanel.add(welcomeTitle);
         welcomePanel.add(welcomeSub);
+        welcomePanel.add(enable2FALink);
         
         mainPanel.add(welcomePanel);
         
         return mainPanel;
     }
+
+    /** Called after 2FA has been enabled for this user. */
+    public void hideTwoFactorLink() {
+        if (enable2FALink != null) {
+            enable2FALink.setVisible(false);
+        }
+    }
     
-    private void loadUserEmail() {
+    public void loadUserEmail() {
         // Try to get user email from backend
         try {
             URL url = new URL("http://localhost:8080/api/user");
@@ -130,8 +169,6 @@ public class DashboardFrame extends JFrame {
                     response.append(line);
                 }
                 br.close();
-                
-                // Extract email from JSON response (simple extraction)
                 String responseStr = response.toString();
                 if (responseStr.contains("\"email\"")) {
                     String email = responseStr.replaceAll(".*\"email\"\\s*:\\s*\"([^\"]+)\".*", "$1");
@@ -139,11 +176,17 @@ public class DashboardFrame extends JFrame {
                 }
             }
         } catch (Exception e) {
-            // If we can't get email, keep the default "—"
             System.out.println("Could not load user email: " + e.getMessage());
         }
+        // Hide 2FA link if already enabled for this user (use label or login email)
+        String emailToCheck = userEmailLabel.getText();
+        if (emailToCheck == null || emailToCheck.trim().isEmpty() || "—".equals(emailToCheck.trim())) {
+            emailToCheck = loginEmail;
+        }
+        if (emailToCheck != null && !emailToCheck.trim().isEmpty() && TwoFactorStore.isEnabledForEmail(emailToCheck) && enable2FALink != null) {
+            enable2FALink.setVisible(false);
+        }
     }
-
 
     private void logout() {
         LoginFrame.SESSION_COOKIE = null;

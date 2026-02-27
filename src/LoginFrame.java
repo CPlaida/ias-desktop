@@ -182,20 +182,77 @@ public class LoginFrame extends JFrame {
 
             String idToken = firebaseLogin(email, password);
 
-            boolean success = sendTokenToBackend(idToken);
+            SessionLoginResult result = sendTokenToBackend(idToken);
 
-            if (success) {
-                new DashboardFrame();
-                dispose();
-            } else {
+            if (!result.success) {
                 JOptionPane.showMessageDialog(this, "Backend Login Failed");
                 clearForm();
+                return;
             }
+
+            boolean local2faEnabled = TwoFactorStore.isEnabledForEmail(email);
+            boolean needTotp = result.requiresTotp || local2faEnabled;
+
+            if (needTotp) {
+                TotpVerifyDialog totpDialog = new TotpVerifyDialog(this);
+                totpDialog.setVisible(true);
+                String code = totpDialog.getEnteredCode();
+                if (code == null) {
+                    clearForm();
+                    return;
+                }
+                boolean ok;
+                if (result.requiresTotp) {
+                    ok = verifyTotpWithBackend(code);
+                } else {
+                    String secret = TwoFactorStore.getSecretForEmail(email);
+                    ok = secret != null && TOTP.verify(secret, code);
+                }
+                if (!ok) {
+                    JOptionPane.showMessageDialog(this, "Invalid or expired code. Please try again.");
+                    clearForm();
+                    return;
+                }
+            }
+
+            new DashboardFrame(email);
+            dispose();
 
         } catch (Exception e) {
             e.printStackTrace();
             JOptionPane.showMessageDialog(this, "Login Failed: " + e.getMessage());
             clearForm();
+        }
+    }
+
+    /** Result of session login: success and whether TOTP verification is required. */
+    private static class SessionLoginResult {
+        final boolean success;
+        final boolean requiresTotp;
+        SessionLoginResult(boolean success, boolean requiresTotp) {
+            this.success = success;
+            this.requiresTotp = requiresTotp;
+        }
+    }
+
+    /** POST TOTP code to backend; returns true if verification succeeded. */
+    private boolean verifyTotpWithBackend(String code) {
+        try {
+            URL url = new URL("http://localhost:8080/api/totp/verify");
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            if (SESSION_COOKIE != null) {
+                conn.setRequestProperty("Cookie", SESSION_COOKIE);
+            }
+            conn.setDoOutput(true);
+            String json = "{\"code\":\"" + code + "\"}";
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(json.getBytes());
+            }
+            return conn.getResponseCode() == 200;
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -206,6 +263,10 @@ public class LoginFrame extends JFrame {
     }
 
     private String firebaseLogin(String email, String password) throws Exception {
+
+        if (email == null || email.trim().isEmpty() || password == null || password.isEmpty()) {
+            throw new Exception("Email and password are required.");
+        }
 
         String firebaseUrl =
                 "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key="
@@ -228,28 +289,47 @@ public class LoginFrame extends JFrame {
             os.write(jsonInput.getBytes());
         }
 
-        BufferedReader br = new BufferedReader(
-                new InputStreamReader(conn.getInputStream()));
+        int responseCode = conn.getResponseCode();
+
+        InputStream stream = (responseCode == 200)
+                ? conn.getInputStream()
+                : conn.getErrorStream();
 
         StringBuilder response = new StringBuilder();
-        String line;
-
-        while ((line = br.readLine()) != null) {
-            response.append(line);
+        if (stream != null) {
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(stream))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    response.append(line);
+                }
+            }
         }
 
-        br.close();
-
         String result = response.toString();
-        System.out.println("Firebase Response: " + result);
+        System.out.println("Firebase Response (" + responseCode + "): " + result);
 
-        // Safe extraction
+        if (responseCode != 200) {
+            // Try to extract a friendly Firebase error message
+            String message = "Login Failed.";
+            if (result.contains("\"message\"")) {
+                String extracted = result.replaceAll(".*\"message\"\\s*:\\s*\"([^\"]+)\".*", "$1");
+                if (!extracted.isEmpty() && !extracted.equals(result)) {
+                    message = extracted;
+                }
+            }
+            throw new Exception(message + " (HTTP " + responseCode + ")");
+        }
+
+        // Safe extraction of idToken on success
         String idToken = result.replaceAll(".*\"idToken\"\\s*:\\s*\"([^\"]+)\".*", "$1");
+        if (idToken == null || idToken.isEmpty() || idToken.equals(result)) {
+            throw new Exception("Could not parse idToken from Firebase response.");
+        }
 
         return idToken;
     }
 
-    private boolean sendTokenToBackend(String idToken) throws Exception {
+    private SessionLoginResult sendTokenToBackend(String idToken) throws Exception {
 
         URL url = new URL("http://localhost:8080/api/sessionLogin");
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
@@ -267,17 +347,25 @@ public class LoginFrame extends JFrame {
         int responseCode = conn.getResponseCode();
         System.out.println("Backend Response Code: " + responseCode);
 
-        // 🔥 Extract ONLY JSESSIONID
+        // Read response body (for requiresTotp flag)
+        String responseBody = "";
+        try (InputStream in = responseCode == 200 ? conn.getInputStream() : conn.getErrorStream()) {
+            if (in != null) {
+                responseBody = new String(in.readAllBytes());
+            }
+        }
+        boolean requiresTotp = responseBody.contains("\"requiresTotp\"") && responseBody.contains("true");
+
+        // Extract session cookie
         Map<String, List<String>> headers = conn.getHeaderFields();
         List<String> cookies = headers.get("Set-Cookie");
-
-        if (cookies != null) {
+        if (cookies != null && !cookies.isEmpty()) {
             String rawCookie = cookies.get(0);
-            SESSION_COOKIE = rawCookie.split(";")[0]; // IMPORTANT
+            SESSION_COOKIE = rawCookie.split(";")[0];
             System.out.println("Saved Session Cookie: " + SESSION_COOKIE);
         }
 
-        return responseCode == 200;
+        return new SessionLoginResult(responseCode == 200, requiresTotp);
     }
 
     
