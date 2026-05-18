@@ -9,7 +9,9 @@ import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 public class LoginFrame extends JFrame {
 
@@ -26,6 +28,23 @@ public class LoginFrame extends JFrame {
     private static final Color BUTTON_GREEN = new Color(109, 179, 63); // #6DB33F
     private static final Color LINK_BLUE = new Color(0, 0, 255); // #0000FF
     private static final Color FIELD_BORDER = new Color(204, 204, 204); // #CCCCCC
+    private static final String[] TOTP_REQUIRED_KEYS = {
+            "requiresTotp",
+            "requiresTOTP",
+            "requireTotp",
+            "totpRequired",
+            "totp_enabled",
+            "totpEnabled",
+            "twoFactorEnabled",
+            "two_factor_enabled",
+            "mfaEnabled",
+            "mfa_enabled",
+            "twoFactorAuthEnabled",
+            "two_factor_auth_enabled",
+            "isTwoFactorEnabled",
+            "isMfaEnabled",
+            "2faEnabled"
+    };
 
     public LoginFrame() {
         setTitle("IAS Firebase Login");
@@ -180,6 +199,7 @@ public class LoginFrame extends JFrame {
             String email = emailField.getText();
             String password = new String(passwordField.getPassword());
 
+            SESSION_COOKIE = null;
             String idToken = firebaseLogin(email, password);
 
             SessionLoginResult result = sendTokenToBackend(idToken);
@@ -203,7 +223,7 @@ public class LoginFrame extends JFrame {
                 }
                 boolean ok;
                 if (result.requiresTotp) {
-                    ok = verifyTotpWithBackend(code);
+                    ok = verifyTotpWithBackend(result, email, code);
                 } else {
                     String secret = TwoFactorStore.getSecretForEmail(email);
                     ok = secret != null && TOTP.verify(secret, code);
@@ -215,7 +235,7 @@ public class LoginFrame extends JFrame {
                 }
             }
 
-            new DashboardFrame(email);
+            new DashboardFrame(email, needTotp);
             dispose();
 
         } catch (Exception e) {
@@ -229,16 +249,64 @@ public class LoginFrame extends JFrame {
     private static class SessionLoginResult {
         final boolean success;
         final boolean requiresTotp;
-        SessionLoginResult(boolean success, boolean requiresTotp) {
+        final String tempToken;
+        SessionLoginResult(boolean success, boolean requiresTotp, String tempToken) {
             this.success = success;
             this.requiresTotp = requiresTotp;
+            this.tempToken = tempToken;
         }
     }
 
     /** POST TOTP code to backend; returns true if verification succeeded. */
-    private boolean verifyTotpWithBackend(String code) {
+    private boolean verifyTotpWithBackend(SessionLoginResult result, String email, String code) {
+        String safeEmail = jsonEscape(email != null ? email.trim() : "");
+        String safeCode = jsonEscape(code != null ? code.trim() : "");
+        String safeTempToken = jsonEscape(result.tempToken);
+        if (!safeTempToken.isEmpty()) {
+            int responseCode = postJson(
+                    "http://localhost:8080/api/verifyTotp",
+                    "{\"tempToken\":\"" + safeTempToken + "\",\"code\":\"" + safeCode + "\"}"
+            );
+            return responseCode == 200;
+        }
+
+        String[] urls = {
+                "http://localhost:8080/api/verifyTotp",
+                "http://localhost:8080/api/totp/verify",
+                "http://localhost:8080/api/2fa/verify",
+                "http://localhost:8080/api/mfa/verify",
+                "http://localhost:8080/api/two-factor/verify"
+        };
+        String[] payloads = {
+                "{\"code\":\"" + safeCode + "\"}",
+                "{\"totp\":\"" + safeCode + "\"}",
+                "{\"totpCode\":\"" + safeCode + "\"}",
+                "{\"token\":\"" + safeCode + "\"}",
+                "{\"otp\":\"" + safeCode + "\"}",
+                "{\"email\":\"" + safeEmail + "\",\"code\":\"" + safeCode + "\"}",
+                "{\"email\":\"" + safeEmail + "\",\"totp\":\"" + safeCode + "\"}",
+                "{\"email\":\"" + safeEmail + "\",\"totpCode\":\"" + safeCode + "\"}",
+                "{\"email\":\"" + safeEmail + "\",\"token\":\"" + safeCode + "\"}",
+                "{\"email\":\"" + safeEmail + "\",\"otp\":\"" + safeCode + "\"}"
+        };
+
+        for (String verifyUrl : urls) {
+            for (String payload : payloads) {
+                int responseCode = postJson(verifyUrl, payload);
+                if (responseCode == 200) {
+                    return true;
+                }
+                if (responseCode == 404 || responseCode == 405) {
+                    break;
+                }
+            }
+        }
+        return false;
+    }
+
+    private int postJson(String requestUrl, String json) {
         try {
-            URL url = new URL("http://localhost:8080/api/totp/verify");
+            URL url = new URL(requestUrl);
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json");
@@ -246,13 +314,20 @@ public class LoginFrame extends JFrame {
                 conn.setRequestProperty("Cookie", SESSION_COOKIE);
             }
             conn.setDoOutput(true);
-            String json = "{\"code\":\"" + code + "\"}";
             try (OutputStream os = conn.getOutputStream()) {
                 os.write(json.getBytes());
             }
-            return conn.getResponseCode() == 200;
+            int responseCode = conn.getResponseCode();
+            saveSessionCookie(conn);
+            System.out.println("TOTP verify " + requestUrl + " -> HTTP " + responseCode);
+            String responseBody = readResponseBody(conn, responseCode);
+            if (!responseBody.isEmpty()) {
+                System.out.println("TOTP verify response: " + responseBody);
+            }
+            return responseCode;
         } catch (Exception e) {
-            return false;
+            System.out.println("TOTP verify failed for " + requestUrl + ": " + e.getMessage());
+            return -1;
         }
     }
 
@@ -348,15 +423,85 @@ public class LoginFrame extends JFrame {
         System.out.println("Backend Response Code: " + responseCode);
 
         // Read response body (for requiresTotp flag)
-        String responseBody = "";
-        try (InputStream in = responseCode == 200 ? conn.getInputStream() : conn.getErrorStream()) {
-            if (in != null) {
-                responseBody = new String(in.readAllBytes());
+        String responseBody = readResponseBody(conn, responseCode);
+        System.out.println("Backend Response Body: " + responseBody);
+        // Extract session cookie
+        saveSessionCookie(conn);
+
+        boolean requiresTotp = hasTrueBoolean(responseBody, TOTP_REQUIRED_KEYS);
+        String tempToken = extractJsonString(responseBody, "tempToken");
+        if (!requiresTotp && responseCode == 200 && !tempToken.isEmpty()) {
+            requiresTotp = true;
+        }
+        if (!requiresTotp && responseCode == 200 && SESSION_COOKIE != null) {
+            requiresTotp = fetchTotpStatusFromBackend();
+        }
+
+        return new SessionLoginResult(responseCode == 200, requiresTotp, tempToken);
+    }
+
+    private boolean fetchTotpStatusFromBackend() {
+        String[] statusUrls = {
+                "http://localhost:8080/api/totp/status",
+                "http://localhost:8080/api/user"
+        };
+        for (String statusUrl : statusUrls) {
+            try {
+                URL url = new URL(statusUrl);
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("GET");
+                if (SESSION_COOKIE != null) {
+                    conn.setRequestProperty("Cookie", SESSION_COOKIE);
+                }
+                int responseCode = conn.getResponseCode();
+                if (responseCode != 200) {
+                    continue;
+                }
+                String body = readResponseBody(conn, responseCode);
+                System.out.println("TOTP status " + statusUrl + " -> " + body);
+                if (hasTrueBoolean(body, TOTP_REQUIRED_KEYS)) {
+                    return true;
+                }
+            } catch (Exception ignored) {
             }
         }
-        boolean requiresTotp = responseBody.contains("\"requiresTotp\"") && responseBody.contains("true");
+        return false;
+    }
 
-        // Extract session cookie
+    private static boolean hasTrueBoolean(String json, String... keys) {
+        if (json == null || json.trim().isEmpty()) {
+            return false;
+        }
+        for (String key : keys) {
+            String quotedKey = Pattern.quote(key);
+            Pattern trueBoolean = Pattern.compile(
+                    "\"(?i:" + quotedKey + ")\"\\s*:\\s*(?:true|1|\"true\"|\"1\"|\"enabled\")",
+                    Pattern.CASE_INSENSITIVE
+            );
+            if (trueBoolean.matcher(json).find()) {
+                return true;
+            }
+        }
+        String lower = json.toLowerCase(Locale.ROOT);
+        return lower.contains("multi-factor-auth-required")
+                || lower.contains("mfa_required")
+                || lower.contains("totp_required")
+                || lower.contains("two_factor_required");
+    }
+
+    private static String readResponseBody(HttpURLConnection conn, int responseCode) throws IOException {
+        InputStream in = responseCode >= 200 && responseCode < 400
+                ? conn.getInputStream()
+                : conn.getErrorStream();
+        if (in == null) {
+            return "";
+        }
+        try (InputStream stream = in) {
+            return new String(stream.readAllBytes());
+        }
+    }
+
+    private static void saveSessionCookie(HttpURLConnection conn) {
         Map<String, List<String>> headers = conn.getHeaderFields();
         List<String> cookies = headers.get("Set-Cookie");
         if (cookies != null && !cookies.isEmpty()) {
@@ -364,8 +509,30 @@ public class LoginFrame extends JFrame {
             SESSION_COOKIE = rawCookie.split(";")[0];
             System.out.println("Saved Session Cookie: " + SESSION_COOKIE);
         }
+    }
 
-        return new SessionLoginResult(responseCode == 200, requiresTotp);
+    private static String extractJsonString(String json, String key) {
+        if (json == null || json.isEmpty() || key == null || key.isEmpty()) {
+            return "";
+        }
+        Pattern pattern = Pattern.compile(
+                "\"" + Pattern.quote(key) + "\"\\s*:\\s*\"([^\"]*)\"",
+                Pattern.CASE_INSENSITIVE
+        );
+        java.util.regex.Matcher matcher = pattern.matcher(json);
+        return matcher.find() ? matcher.group(1) : "";
+    }
+
+    private static String jsonEscape(String value) {
+        if (value == null) {
+            return "";
+        }
+        return value
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t");
     }
 
     

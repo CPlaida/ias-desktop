@@ -16,6 +16,7 @@ public class DashboardFrame extends JFrame {
     private JLabel enable2FALink;
     /** Email used at login - used for 2FA even if /api/user fails */
     private final String loginEmail;
+    private final boolean twoFactorEnabledAtLogin;
 
     // Colors matching web design (like localhost:8080/dashboard)
     private static final Color BG_COLOR = new Color(248, 248, 248); // #F8F8F8
@@ -25,7 +26,13 @@ public class DashboardFrame extends JFrame {
 
     /** @param loginEmail email used to log in (so 2FA can be keyed correctly even without backend) */
     public DashboardFrame(String loginEmail) {
+        this(loginEmail, false);
+    }
+
+    /** @param twoFactorEnabledAtLogin true when login already required/passed 2FA */
+    public DashboardFrame(String loginEmail, boolean twoFactorEnabledAtLogin) {
         this.loginEmail = loginEmail != null ? loginEmail.trim() : "";
+        this.twoFactorEnabledAtLogin = twoFactorEnabledAtLogin;
         setTitle("IAS Dashboard");
         setSize(900, 700);
         setLocationRelativeTo(null);
@@ -42,6 +49,9 @@ public class DashboardFrame extends JFrame {
         // Show login email immediately so 2FA setup always has the right email
         if (!this.loginEmail.isEmpty()) {
             userEmailLabel.setText(this.loginEmail);
+        }
+        if (this.twoFactorEnabledAtLogin) {
+            hideTwoFactorLink();
         }
         setVisible(true);
         loadUserEmail();
@@ -183,7 +193,9 @@ public class DashboardFrame extends JFrame {
         if (emailToCheck == null || emailToCheck.trim().isEmpty() || "—".equals(emailToCheck.trim())) {
             emailToCheck = loginEmail;
         }
-        if (emailToCheck != null && !emailToCheck.trim().isEmpty() && TwoFactorStore.isEnabledForEmail(emailToCheck) && enable2FALink != null) {
+        if (enable2FALink != null
+                && (twoFactorEnabledAtLogin
+                || (emailToCheck != null && !emailToCheck.trim().isEmpty() && TwoFactorStore.isEnabledForEmail(emailToCheck)))) {
             enable2FALink.setVisible(false);
         }
     }
